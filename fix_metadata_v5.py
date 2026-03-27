@@ -298,9 +298,65 @@ def ask_llm_pydantic(prompt: str, pydantic_schema, stage_name="LLM"):
             
     return None
 
+def remove_empty_elements(d):
+    """Récursivement supprime les dictionnaires ou listes vides."""
+    if not isinstance(d, (dict, list)):
+        return d
+    if isinstance(d, list):
+        return [v for v in (remove_empty_elements(v) for v in d) if v is not None and v != "" and v != [] and v != {}]
+    if isinstance(d, dict):
+        cleaned = {k: remove_empty_elements(v) for k, v in d.items()}
+        return {k: v for k, v in cleaned.items() if v is not None and v != "" and v != [] and v != {}}
+
+def deep_merge(target, source):
+    """Fusionne récursivement un json généré par le LLM (source) dans le dataset complet (target)."""
+    if isinstance(source, dict):
+        for k, v in source.items():
+            if k not in target:
+                if isinstance(v, list): target[k] = []
+                elif isinstance(v, dict): target[k] = {}
+            
+            if isinstance(target.get(k), list) and isinstance(v, list):
+                clean_t = [str(x).title() for x in v]
+                target[k].extend(clean_t)
+                target[k] = sorted(list(set(target[k])))
+            elif isinstance(target.get(k), dict) and isinstance(v, dict):
+                deep_merge(target[k], v)
+    return target
+
+def extract_ontology_keys(d, parent_keys=None):
+    if parent_keys is None: parent_keys = []
+    keys_map = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                keys_map[k] = parent_keys + [k]
+                keys_map.update(extract_ontology_keys(v, parent_keys + [k]))
+            elif isinstance(v, list):
+                keys_map[k] = parent_keys + [k]
+    return keys_map
+
+def insert_deep(d, path_list, term):
+    current = d
+    for i, p in enumerate(path_list):
+        if i == len(path_list) - 1:
+            if p not in current:
+                current[p] = []
+            if isinstance(current[p], list):
+                current[p].append(term)
+                current[p] = sorted(list(set(current[p])))
+            elif isinstance(current[p], dict):
+                if "General" not in current[p]: current[p]["General"] = []
+                current[p]["General"].append(term)
+                current[p]["General"] = sorted(list(set(current[p]["General"])))
+        else:
+            if p not in current:
+                current[p] = {}
+            current = current[p]
+
 def clean_thesaurus():
     print("\n=================================================================")
-    print("   EXÉCUTION DE LA PASSE DE NETTOYAGE DU THESAURUS (HYBRIDE)")
+    print("   EXÉCUTION DE LA PASSE DE NETTOYAGE DU THESAURUS (DEEP-HYBRID)")
     print("=================================================================")
     
     if not os.path.exists(KEYWORDS_FILE):
@@ -320,19 +376,25 @@ def clean_thesaurus():
         
     print(f"-> Nettoyage de {len(uncategorized)} termes sauvages en cours...")
     
-    # 1. Nettoyage Python (Deduplication et Filtres basiques)
+    # 1. Nettoyage Python (Deduplication, Parens, Regex, & and/or split)
     cleaned_terms = set()
     for t in uncategorized:
-        term = str(t).strip().title()
-        if not term: continue
-        # Filtre Regex : si contient plus de 5 mots ou commence par un chiffre
-        if len(term.split()) > 5: continue
-        if bool(re.match(r'^\d', term)): continue
-        cleaned_terms.add(term)
+        raw_val = str(t)
+        # Supprimer ce qui est entre parenthèses
+        raw_val = re.sub(r'\(.*?\)', '', raw_val).strip()
         
-    print(f"   [Étape 1] Déduplication Python : {len(uncategorized)} -> {len(cleaned_terms)} termes")
+        # Split on " and " and " or "
+        parts = re.split(r'\s+and\s+|\s+or\s+', raw_val, flags=re.IGNORECASE)
+        for part in parts:
+            term = part.strip()
+            if not term: continue
+            if len(term.split()) > 5: continue
+            if bool(re.match(r'^\d', term)): continue
+            cleaned_terms.add(term) # Will titlecase later
+        
+    print(f"   [Étape 1] Split & Regex : {len(uncategorized)} -> {len(cleaned_terms)} termes")
     
-    # 2. Filtrage NLP (spaCy)
+    # 2. Filtrage NLP (spaCy) : Grammaire et Lemmatisation Strict
     try:
         import spacy
         try:
@@ -344,57 +406,64 @@ def clean_thesaurus():
             
         nlp_filtered = set()
         for term in cleaned_terms:
-            doc = nlp(term)
+            # Lowercase avant l'analyse pour que spaCy détecte bien les pluriels communs (NNS) au lieu des Noms Propres (NNP)
+            doc = nlp(term.lower())
             has_verb = any(token.pos_ in ["VERB", "AUX"] for token in doc)
             if not has_verb:
-                nlp_filtered.add(term)
+                # Lemmatisation des pluriels (NNS, NNPS) vers singulier
+                lemma_tokens = []
+                for token in doc:
+                    if token.tag_ in ["NNS", "NNPS"]:
+                        lemma_tokens.append(token.lemma_)
+                    else:
+                        lemma_tokens.append(token.text)
                 
-        print(f"   [Étape 2] Filtrage NLP (spaCy) : {len(cleaned_terms)} -> {len(nlp_filtered)} termes")
+                # Reconstitue et force le Title Case
+                lemma_term = " ".join(lemma_tokens).title()
+                if lemma_term:
+                    nlp_filtered.add(lemma_term)
+                
+        print(f"   [Étape 2] Filtrage NLP & Lemmatisation (spaCy) : {len(cleaned_terms)} -> {len(nlp_filtered)} termes")
         terms_to_route = list(nlp_filtered)
     except ImportError:
-        print("   [Étape 2] Librairie spaCy introuvable. Étape NLP ignorée (pip install spacy).")
-        terms_to_route = list(cleaned_terms)
+        print("   [Étape 2] Librairie spaCy introuvable. Étape ignorée.")
+        terms_to_route = list({t.title() for t in cleaned_terms})
 
-    # 3. Ancrage Vectoriel Existant (Vector Similarity Routing)
-    print("   [Étape 3] Auto-Catégorisation par Similarité Vectorielle (FAISS/Nomic)...")
+    # 3. Ancrage Vectoriel FAISS Récursif
+    print("   [Étape 3] Auto-Catégorisation Vectorielle Strict (Nomic)...")
     anchor = VectorAnchor()
     ontology_map = {}
+    
+    # Construction récursive de toutes les branches du graphe
     for top_lvl, content in data.items():
         if top_lvl in ["Uncategorized_New", "Predicates", "Entities"]: continue
-        if isinstance(content, dict):
-            for sub_lvl in content.keys():
-                ontology_map[sub_lvl] = (top_lvl, sub_lvl)
-        else:
-            ontology_map[top_lvl] = (top_lvl, "General")
+        if isinstance(content, dict) or isinstance(content, list):
+            keys = extract_ontology_keys({top_lvl: content})
+            ontology_map.update(keys)
             
     anchor.index_ontology(list(ontology_map.keys()))
     
     slm_fallback = []
     auto_routed = 0
     
+    # Seuil extrêmement strict (0.91)
     for term in terms_to_route:
-        best_match, score = anchor.resolve(term, threshold=0.82)
+        best_match, score = anchor.resolve(term, threshold=0.91)
         if best_match != term: 
-            top_lvl, sub_lvl = ontology_map[best_match]
-            if isinstance(data[top_lvl], dict):
-                if sub_lvl not in data[top_lvl]: data[top_lvl][sub_lvl] = []
-                data[top_lvl][sub_lvl].append(term)
-                data[top_lvl][sub_lvl] = sorted(list(set(data[top_lvl][sub_lvl])))
-            else:
-                if not isinstance(data[top_lvl], list): data[top_lvl] = []
-                data[top_lvl].append(term)
+            path_list = ontology_map[best_match]
+            insert_deep(data, path_list, term)
             auto_routed += 1
         else:
             slm_fallback.append(term)
             
-    print(f"   -> {auto_routed} termes ont été catégorisés automatiquement par ancrage !")
+    print(f"   -> {auto_routed} termes ont été catégorisés mathématiquement (Seuil > 0.91) !")
     
     # 4. Traitement SLM (Ollama Batched)
     if not slm_fallback:
         print("   [Étape 4] Aucun terme isolé restant pour le SLM.")
         data["Uncategorized_New"] = []
     else:
-        print(f"   [Étape 4] Traitement des {len(slm_fallback)} termes restants par le SLM (Qwen) en batch...")
+        print(f"   [Étape 4] Traitement des {len(slm_fallback)} termes complexes par Qwen (Batches)...")
         batch_size = 50
         top_cats = [k for k in data.keys() if k not in ["Uncategorized_New", "Predicates", "Entities"]]
         
@@ -404,24 +473,26 @@ def clean_thesaurus():
             print(f"      -> Batch SLM [{i+1} à min({i+batch_size}, {len(slm_fallback)})]...")
             
             prompt = f"""Role: Expert Data Architect and Ontologist.
-Task: Process this small batch of raw keywords. Translate them to English, convert to Title Case, merge abbreviations, and categorize them strictly into the top-level JSON taxonomy provided. 
-You can create concise new sub-category keys inside the top-level categories if needed.
+Task: Meticulously process this batch of diverse keywords. 
+1. TRANSLATION: You MUST absolutely translate all non-English terms (especially French terms) to English.
+2. Ensure everything is Title Case.
+3. Categorize them logically under the exact Top-Level Categories provided as root keys.
+4. DEEP HIERARCHY: You are allowed to create deeply nested sub-categories (e.g., "Artificial Intelligence" -> "Generative AI" -> "LLMs" -> ["GPT-4", "Claude"]). Do not clump everything in generic arrays. Create precise N-level dictionary structures where appropriate, ending with an array of the leaf keywords.
 
-Allowed Top-Level Categories: {json.dumps(top_cats)}
+Allowed Top-Level Categories (MUST be exactly these Root Keys): {json.dumps(top_cats)}
 
 Input Keywords Batch:
 {json.dumps(batch)}
 
 Output Constraints:
-Output ONLY a valid JSON object matching the exact Top-Level categories as root keys, containing the categorized keywords inside sub-category arrays. 
-DO NOT output markdown, no explanations, just valid JSON."""
+Output ONLY a valid JSON object matching the exact Top-Level categories as root keys. DO NOT output markdown."""
 
             try:
                 t0 = time.time()
                 res = ollama.chat(
                     model=MODEL_NAME, 
                     messages=[
-                        {'role': 'system', 'content': 'You must output ONLY valid JSON without markdown wrapping.'},
+                        {'role': 'system', 'content': 'You must output ONLY valid JSON without markdown wrapping. Your sub-categories must be extremely precise, nested dictionary trees if needed.'},
                         {'role': 'user', 'content': prompt}
                     ], 
                     format='json',
@@ -433,19 +504,16 @@ DO NOT output markdown, no explanations, just valid JSON."""
                 duration = time.time() - t0
                 print(f"         [OK] Batch analysé en {duration:.1f}s")
                 
-                # Fusion des résultats du batch dans 'data'
-                for top_lvl, content in slm_parsed.items():
-                    if top_lvl in data and isinstance(data[top_lvl], dict) and isinstance(content, dict):
-                        for sub_lvl, terms in content.items():
-                            if not isinstance(terms, list): continue
-                            if sub_lvl not in data[top_lvl]: data[top_lvl][sub_lvl] = []
-                            data[top_lvl][sub_lvl].extend(terms)
-                            data[top_lvl][sub_lvl] = sorted(list(set(data[top_lvl][sub_lvl])))
+                # Fusion des résultats récursifs dans 'data'
+                deep_merge(data, slm_parsed)
             except Exception as e:
                 print(f"         [ERREUR] Batch échoué : {e}")
                 failed_terms.extend(batch)
 
         data["Uncategorized_New"] = sorted(list(set(failed_terms)))
+    
+    # Nettoyage final des structures vides générées par le LLM ou vidées par le processus
+    data = remove_empty_elements(data)
         
     try:
         with open(KEYWORDS_FILE, 'w', encoding='utf-8') as f:
