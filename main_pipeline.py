@@ -1,0 +1,90 @@
+import os
+import sys
+import subprocess
+import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+def run_script(script_name):
+    script_path = os.path.join(SCRIPT_DIR, script_name)
+    if not os.path.exists(script_path):
+        print(f"\n[ERREUR] Le script '{script_name}' est introuvable.")
+        return False
+    
+    print(f"\n>>> Lancement de {script_name}...")
+    try:
+        # On utilise sys.executable pour s'assurer d'utiliser le même environnement Python
+        subprocess.run([sys.executable, script_path], check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERREUR] Le script '{script_name}' a échoué.")
+        return False
+    except KeyboardInterrupt:
+        print("\n[INFO] Interruption par l'utilisateur.")
+        return False
+
+def main_menu():
+    while True:
+        clear_screen()
+        print("=================================================================")
+        print("       INDUSTRIAL KNOWLEDGE GRAPH PIPELINE (V6 ORCHESTRATOR)      ")
+        print("=================================================================")
+        print(" --- WORKFLOWS AUTOMATIQUES ---")
+        print(" [A] INITIALISATION DU PROJET (À faire une seule fois au début)")
+        print("     Séquence : Renommage -> Création Taxonomie -> Extraction -> Nettoyage")
+        print(" [B] MISE À JOUR AU FIL DE L'EAU (Pour les nouveaux PDF)")
+        print("     Séquence : Renommage -> Extraction -> Nettoyage (Bypass Taxonomie)")
+        print("\n --- EXÉCUTION MANUELLE ---")
+        print(" [1] Étape 0 : Renommer les fichiers PDF (renamer.py)")
+        print(" [2] Étape 1 : Construire la Taxonomie T-Box (build_taxonomy.py)")
+        print(" [3] Étape 2 : Extraire le Graphe & Enrichir (fix_metadata.py)")
+        print(" [4] Étape 3 : Nettoyage Avancé du Thésaurus (thesaurus_manager.py)")
+        print(" ---------------------------------------------------------------")
+        print(" [Q] Quitter")
+        print("=================================================================")
+        
+        choice = input("\nVotre choix : ").strip().upper()
+        
+        if choice == 'A':
+            print("\n>>> DÉMARRAGE : INITIALISATION COMPLÈTE (COLD START)")
+            if run_script("renamer.py") and run_script("build_taxonomy.py"):
+                if run_script("fix_metadata.py"):
+                    run_script("thesaurus_manager.py")
+            input("\nInitialisation terminée. Appuyez sur Entrée...")
+            
+        elif choice == 'B':
+            print("\n>>> DÉMARRAGE : MISE À JOUR AU FIL DE L'EAU (INCREMENTAL)")
+            if run_script("renamer.py") and run_script("fix_metadata.py"):
+                run_script("thesaurus_manager.py")
+            input("\nMise à jour terminée. Appuyez sur Entrée...")
+            
+        # ... (Garder la suite des choix 1, 2, 3, 4 et Q identiques)
+            
+        elif choice == '1':
+            run_script("renamer.py")
+            input("\nAppuyez sur Entrée...")
+            
+        elif choice == '2':
+            run_script("build_taxonomy.py")
+            input("\nAppuyez sur Entrée...")
+            
+        elif choice == '3':
+            run_script("fix_metadata.py")
+            input("\nAppuyez sur Entrée...")
+            
+        elif choice == '4':
+            run_script("thesaurus_manager.py")
+            input("\nAppuyez sur Entrée...")
+            
+        elif choice == 'Q':
+            print("\nFermeture du pipeline. Au revoir !")
+            break
+        else:
+            print("\nChoix invalide.")
+            time.sleep(1)
+
+if __name__ == "__main__":
+    main_menu()
