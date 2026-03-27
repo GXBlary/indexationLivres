@@ -266,4 +266,161 @@ Deux concepts qui apparaissent dans les mêmes documents sont sémantiquement pr
 
 **Conclusion** : Cette approche séquentielle est validée pour la production.
 
-**Prérequis** : Reconstruire le mapping `concept → résumé(s) source`. Actuellement `concepts_cache.json` ne contient pas cette traçabilité. Il faut soit modifier Phase 1 pour la sauvegarder, soit la recalculer par recherche textuelle.
+**Note sur l'implémentation** : Le mapping `concept → résumé(s) source` est désormais recalculé dynamiquement en Phase 3 via une recherche regex, évitant ainsi de modifier le format de `concepts_cache.json`.
+
+---
+
+### Expérience 6 : Optimisations de Précision et Équilibrage (V3 Finale)
+**Date** : 2026-03-27
+**Hypothèse** : L'introduction d'exceptions lexicales et d'une flexibilité morphologique permettra d'éliminer les distorsions de termes (ex: Agentic → Argentic) et d'augmenter la sensibilité de l'ancrage documentaire.
+
+#### Améliorations Apportées
+1. **Protection Lexicale (`IT_VOCAB_EXCEPTIONS`)** : Mise en place d'un dictionnaire de termes protégés pour empêcher `spacy` de déformer les acronymes techniques lors de la lemmatisation.
+2. **Regex Morphologique** : Utilisation de `\b[terme](?:s|es|d|ed|ing)?\b` pour capturer les déclinaisons (pluriels, congugaisons) dans les résumés. Gain significatif de sensibilité pour la matrice de co-occurrence.
+3. **Équilibrage Structurel** :
+    - **Calcul Dynamique de K** : `optimal_k = max(4, len(members) // 12)` pour adapter le nombre de clusters à la taille des domaines.
+    - **Ward Linkage & Euclidean Distance** : Passage au critère de Ward pour les sous-clusters. Cela minimise la variance intra-cluster et "casse" les clusters géants (effet "boule de neige") pour une répartition homogène.
+4. **Dépollution Avancée** : Extension des `DOMAIN_STOP_WORDS` au lexique structurel académique (`author`, `doi`, `abstract`) et aux tics de résumés LLM (`insight`, `overview`, `explore`).
+
+#### Résultats
+- **Stabilité** : Les erreurs de lemmatisation sont résolues.
+- **Granularité** : La structure est plus équilibrée avec des racines comme `Community` et `Digital Transformation` parfaitement segmentées.
+- ---
+
+## Phase 3.1 — Optimisation : Outlier Quarantine (V4.1)
+**Date** : 2026-03-27
+**Hypothèse** : L'introduction d'un seuil d'exclusion sémantique permettra d'isoler les concepts "bruit" ou trop spécifiques qui polluent les racines majeures.
+
+### Détails Techniques
+- **Seuil d'Outlier** (`0.40`) : Si la similarité cosinus vers la racine la plus proche est < 0.40, le concept est placé en quarantaine.
+- **Root Redundancy** (`0.60`) : Seuil abaissé pour garantir que les 12 racines choisies sont suffisamment distinctes.
+- **Outlier Key** : `"Outliers / Niche Concepts"` regroupant tous les termes non-ancrés.
+
+### Résultats
+- ✅ **Pureté des racines** : Les domaines "Innovation" et "Risk Management" ne contiennent plus de termes orphelins sans rapport.
+- ✅ **Signal / Bruit** : Les concepts de niche (ex: noms propres très rares, termes isolés) sont isolés sans être supprimés, permettant une révision manuelle ultérieure.
+
+---
+
+## Phase 5 — Design : Open IE V5 (Asymmetric Anchoring)
+**Date** : 2026-03-27
+**Contexte** : Raffinement de la stratégie d'extraction pour maximiser la fidélité à la T-Box tout en permettant la découverte de nouvelles relations.
+
+### Architecture Raffinée
+1. **Cold Start (RAM)** : Pré-calcul des embeddings de la T-Box (`thesaurus.json`) pour éviter les lenteurs de recherche lors de l'extraction.
+2. **Idempotence & Sécurité** :
+    - Registre `processed_docs.txt` pour permettre la reprise après interruption.
+    - Format `.jsonl` (append-only) pour garantir l'intégrité des données en cas de crash.
+3. **Ancrage Asymétrique** :
+    - **Sujet (Strict, >0.82)** : Le sujet doit être un concept maîtrisé de l'ontologie.
+    - **Objet (Tolérant, >0.65)** : L'objet peut être un concept libre pour capturer des nuances hors-domaine (métriques, conséquences).
+4. **Audit Final** : Compilation de statistiques d'ancrage pour valider la qualité du graphe avant injection Neo4j.
+
+---
+
+## Réflexion : Alignement d'Ontologies Externes & Entity Linking
+**Date** : 2026-03-27
+**Contexte** : Analyse de l'opportunité de coupler le pipeline local avec des API externes (Linked Open Data - LOD) comme l'INRAE, Wikidata ou DBpedia.
+
+### Défis Structurels Identifiés
+1. **Domain Mismatch (Agriculture vs Tech)** : L'ontologie INRAE est sectorielle. Un corpus IA/Stratégie risque des faux positifs systématiques.
+2. **Obsolescence vs Innovation** : Les termes "Graphrag", "Agentic Workflow" ou "Prompt Chain" ne sont pas encore stabilisés dans les ontologies académiques. Un filtrage externe strict effacerait les signaux faibles et l'innovation.
+3. **Architecture "Local First"** : Le passage au réseau synchronisé briserait l'autonomie actuelle (Qwen/Ollama/Sentence-Transformers) et introduirait une latence importante.
+
+### Variables de Conception à Clarifier
+- **Référentiel** : Wikidata/DBpedia ou CSO (Computer Science Ontology) seraient plus pertinents que des sources sectorielles inadaptées.
+- **Rôle de l'API** : Filtre (Arbitre) ou Enrichisseur (Recours) ? L'enrichissement de repli est privilégié pour conserver la capacité de découverte locale.
+- **Écosystème** : Arbitrage entre autonomie offline et précision normalisée par des tiers.
+
+---
+
+## Résultats PoC : Alignement Wikidata & "Le Piège de l'Ontologie Supérieure"
+**Date** : 2026-03-27
+**Contexte** : Analyse des résultats du script `poc_wikidata_alignment.py` sur 5 outliers types (Adversarial Attack, Fuzzy Set, etc.).
+
+### Analyse des Rejets (Scores < 0.46)
+L'ascension hiérarchique (P279/P31) à une profondeur de 2 niveaux a révélé un **décalage sémantique majeur** :
+- **3D Print** -> Wikidata remonte `recreation`, `technique`, `hobby`.
+- **Adversarial Attack** -> Wikidata remonte `deception`, `abuse`, `communication`.
+- **Fuzzy Set** -> Wikidata remonte `concept`, `class`, `set`.
+
+**Conclusion** : Les parents universels de Wikidata sont trop abstraits pour s'ancrer vectoriellement sur des racines IT locales spécialisées (ex: `Agentic Ai`). C'est le **Upper Ontology Trap**.
+
+### Pivot Stratégique : De l'Alignement à la Canonisation
+Plutôt que de forcer un pont hiérarchique, nous optons pour une stratégie de **Canonisation des Entités** :
+1. **Ancrage Local (Prio 1)** : Similarité > 0.80 -> Absorption par une racine locale.
+2. **Canonisation Wikidata (Prio 2)** : Pour les Outliers (ou non-ancrés), interrogation du endpoint de recherche uniquement pour récupérer le **label normalisé** et l'**ID Q**.
+3. **Interopérabilité Neo4j** : Stockage systématisé de l'URI Wikidata (`http://www.wikidata.org/entity/Q...`) pour chaque nœud identifié.
+
+**Impact** : Le Knowledge Graph devient ouvert et normalisé sans sacrifier la précision du domaine local.
+
+**Statut** : Stratégie de canonisation par ID Q validée pour la Phase 5.
+
+---
+
+## Phase 4 — Design : Semantic Gravity Clustering (V4)
+**Date** : 2026-03-27
+**Contexte** : Transition vers une approche par "Gravité Sémantique" pour éliminer les biais résiduels du co-occurrence (ex: fausse proximité entre termes co-présents mais sémantiquement distincts) et du LDA (inventions de thématiques).
+
+### Nouvelle Architecture
+L'objectif est d'utiliser un modèle d'embedding léger (`sentence-transformers/all-MiniLM-L6-v2`) pour projeter les concepts dans un espace vectoriel dense.
+
+#### 1. Calcul de la Gravité (Racines)
+Chaque concept $c$ reçoit un score de gravité composite :
+$$Weight(c) = DocFrequency(c) \times \sum_{i=1}^{k} CosineSimilarity(c, neighbor_i)$$
+- **Ancrage Réel** (`DocFrequency`) : Fréquence d'apparition dans les résumés.
+- **Ancrage Sémantique** (`Semantic Density`) : Nombre de voisins gravitant autour du concept dans l'espace vectoriel.
+Les $N$ concepts (ex: top 15) ayant le score le plus élevé deviennent les **Catégories Racines**. Ces racines sont de vrais termes du corpus (ex: Machine Learning, Data Governance).
+
+#### 2. Affiliation par Similarité
+Chaque concept restant est rattaché à la racine la plus proche sémantiquement via mesure cosinus. Cela résout le problème de "Data Store" (Data Governance) vs "Community" (Organizational Culture) même s'ils partagent le même document.
+
+#### 3. Nettoyage Curatife (Absorption des Singletons)
+Règle empirique : Toute catégorie/racine ayant moins de 3 concepts est dissoute. Ses membres sont redistribués vers la deuxième racine la plus pertinente.
+
+---
+
+## Expérience 7 : Résultats - Semantic Gravity Clustering (V4 Gold)
+**Date** : 2026-03-27
+**Hypothèse** : L'approche par "Gravité" (Embeddings `all-MiniLM-L6-v2`) produira une structure 2-level plus propre et sémantiquement plus juste que le co-occurrence ou le LDA.
+
+### Résultats Finaux
+L'implémentation a généré une taxonomie de **12 racines majeures**, regroupant les ~900 concepts de manière exclusive et équilibrée.
+
+#### 1. Racines de Gravité (Top 12)
+1. **Digital Transformation** (Ancre centrale)
+2. **Digital Strategy**
+3. **Digital Leadership**
+4. **Innovation**
+5. **Agentic Ai** (Succès : regroupement de "Workflow", "Agentop", "Tool-call")
+6. **Governance**
+7. **Business Model**
+8. **Risk Management** (Succès : "Sustainability", "Incident Response")
+9. **Strategic Alignment**
+10. **Ambidexterity**
+11. **Organizational Ambidexterity**
+12. **Compliance** (Succès : "GDPR", "Secure Multiparty Computation")
+
+#### 2. Analyse Qualitative
+- **Exclusivité** : Chaque concept est rattaché à sa racine la plus dense sémantiquement. Le biais "Community" (fausse proximité documentaire) est rompu.
+- **Structure** : Le dictionnaire est strictement de **niveau 2** (`Root -> [List]`), éliminant les erreurs de récursion lors de l'extraction de triplets.
+- **Couverture** : 100% des concepts extraits en Phase 1 sont mappés.
+- **Absence de Bruit** : Les singletons (< 3 concepts) ont été absorbés par les racines voisines, garantissant une densité minimale par cluster.
+
+---
+
+## Phase 6 — Design : Unified Knowledge Engineering Pipeline (V6)
+**Date** : 2026-03-27
+**Contexte** : Consolidation des prototypes en un moteur maître industriel combinant Open IE, Pydantic, Vector Anchoring et Entity Linking Wikidata.
+
+### Architecture à 3 Niveaux (L'Entonnoir Asymétrique)
+1. **Prio 1 : T-Box Locale** (Score > 0.82) -> Raccrochement aux racines de `thesaurus.json`.
+2. **Prio 2 : Wikidata LOD** (Entity Linking) -> Normalisation via API REST et stockage de l'ID Q.
+3. **Prio 3 : True Outlier** -> Conservation du texte brut pour les concepts ultra-spécifiques.
+
+### Évolutions Techniques
+- **Modèle Pydantic** : Extension avec `subject_uri` / `object_uri`.
+- **Obsidian Sync** : Injection de `wikidata_uri` dans le YAML frontmatter pour l'interopérabilité.
+- **Hygiène du Thésaurus** : Catégorisation interne dédiée aux entités alignées (`Wikidata_Aligned`).
+
+**Statut** : Prêt pour le déploiement de la V6.

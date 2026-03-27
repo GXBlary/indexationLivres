@@ -11,9 +11,10 @@ from tkinter import filedialog
 import time
 import traceback
 import math
+import requests
 
 # =========================================================================
-# CONFIGURATION V5 (OPEN IE, PYDANTIC & VECTOR ANCHORING)
+# CONFIGURATION V6 (OPEN IE, PYDANTIC, VECTOR ANCHORING & WIKIDATA LOD)
 # =========================================================================
 MODEL_NAME = "qwen2.5:7b-instruct-q4_K_M"
 EMBED_MODEL = "nomic-embed-text"
@@ -29,7 +30,7 @@ HEADER_PAGES = 5
 # =========================================================================
 # L'ONTOLOGIE STRUCTURÉE (ZOD/PYDANTIC MUR)
 # =========================================================================
-ALLOWED_PREDICATES = ['mentions', 'wrote', 'co-authored', 'uses', 'is_defined_as', 'impacts', 'optimizes', 'regulates']
+ALLOWED_PREDICATES = ['mentions', 'wrote', 'co-authored', 'uses', 'is_defined_as', 'impacts', 'optimizes', 'regulates', 'integrates', 'depends_on']
 BANNED_PREDICATES = ['details', 'concerns', 'is_about', 'talks_about', 'explores', 'examines']
 
 class Triplet(BaseModel):
@@ -37,6 +38,8 @@ class Triplet(BaseModel):
     predicate: str = Field(description="The action verb of the T-Box (or a very PRECISE new verb if necessary)")
     object: str = Field(description="The target entity of the relationship")
     validation_status: str = Field(default="validated", description="Internal flag, do not generate")
+    subject_uri: str = Field(default="", description="Wikidata URI if found")
+    object_uri: str = Field(default="", description="Wikidata URI if found")
     
     @model_validator(mode='after')
     def flag_unrecognized_predicates(self) -> 'Triplet':
@@ -63,7 +66,31 @@ class ChunkMining(BaseModel):
     triplets: list[Triplet] = Field(description="The list of Graph relations found in this fragment")
 
 # =========================================================================
-# MOTEUR VECTORIEL (ENTITY RESOLUTION)
+# WIKIDATA API (RÉCONCILIATION LOD)
+# =========================================================================
+def search_wikidata_entity(term: str) -> tuple[str, str]:
+    """Interroge Wikidata pour trouver le label canonique et l'URI."""
+    url = "https://www.wikidata.org/w/api.php"
+    params = {
+        "action": "wbsearchentities",
+        "search": term,
+        "language": "en",
+        "format": "json",
+        "limit": 1
+    }
+    headers = {"User-Agent": "OpenIE_Pipeline/1.0 (contact@local.dev)"}
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=3).json()
+        if response.get('search'):
+            q_id = response['search'][0]['id']
+            label = response['search'][0]['label']
+            return label.title(), f"http://www.wikidata.org/entity/{q_id}"
+    except Exception:
+        pass
+    return term.title(), ""
+
+# =========================================================================
+# MOTEUR VECTORIEL (ENTITY RESOLUTION ENTONNOIR)
 # =========================================================================
 def cosine_similarity(v1: list[float], v2: list[float]) -> float:
     dot = sum(x*y for x, y in zip(v1, v2))
@@ -87,28 +114,44 @@ class VectorAnchor:
                 res = ollama.embeddings(model=self.model, prompt=c_clean)
                 self.ontology_vectors[c_clean] = res['embedding']
             except Exception as e:
-                print(f"   [ERREUR Embedding] 'ollama pull {self.model}' requis. L'ancrage est désactivé. ({e})")
+                print(f"   [ERREUR Embedding] 'ollama pull {self.model}' requis. ({e})")
                 self.ontology_vectors = {}
                 return
                 
-    def resolve(self, raw_entity: str, threshold: float = 0.85) -> tuple[str, float]:
-        """Fusionne l'hallucination si elle a une similarité cosinus > 0.85 avec la T-Box."""
-        if not self.ontology_vectors: return raw_entity, 0.0
-        try:
-            res = ollama.embeddings(model=self.model, prompt=raw_entity)
-            emb = res['embedding']
-            best_score = -1.0
-            best_match = raw_entity
-            for concept, ref_emb in self.ontology_vectors.items():
-                score = cosine_similarity(emb, ref_emb)
-                if score > best_score:
-                    best_score = score
-                    best_match = concept
+    def resolve(self, raw_entity: str, threshold: float = 0.82) -> tuple[str, float, str]:
+        """
+        Entonnoir à 3 niveaux : 
+        1. T-Box Vectorielle
+        2. Wikidata (LOD)
+        3. Texte brut (Outlier)
+        Renvoie: (Label_Canonique, Score_Cosinus, Wikidata_URI)
+        """
+        best_score = 0.0
+        # Niveau 1 : T-Box Locale
+        if self.ontology_vectors:
+            try:
+                res = ollama.embeddings(model=self.model, prompt=raw_entity)
+                emb = res['embedding']
+                best_score = -1.0
+                best_match = raw_entity
+                for concept, ref_emb in self.ontology_vectors.items():
+                    score = cosine_similarity(emb, ref_emb)
+                    if score > best_score:
+                        best_score = score
+                        best_match = concept
+                
+                if best_score >= threshold:
+                    return best_match, best_score, "" # Ancrage T-Box réussi
+            except: 
+                pass
+                
+        # Niveau 2 : Wikidata LOD (Si l'ancrage T-Box a échoué)
+        wiki_label, wiki_uri = search_wikidata_entity(raw_entity)
+        if wiki_uri:
+            return wiki_label, 1.0, wiki_uri # Ancrage Wikidata réussi
             
-            if best_score >= threshold:
-                return best_match, best_score
-            return raw_entity, best_score
-        except: return raw_entity, 0.0
+        # Niveau 3 : True Outlier
+        return raw_entity.title(), best_score, ""
 
 # =========================================================================
 # UTILITAIRES FICHIERS & CALIBRE
@@ -122,7 +165,7 @@ def extract_all_strings(data):
     result = set()
     if isinstance(data, dict):
         for key, val in data.items():
-            if key != "Predicates":
+            if key not in ["Predicates", "Entities"]:
                 result.add(key.strip())
             result.update(extract_all_strings(val))
     elif isinstance(data, list):
@@ -136,8 +179,6 @@ def load_keywords_registry():
         try:
             with open(KEYWORDS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                
-                # Load Predicates if they exist
                 if "Predicates" in data:
                     allowed = data["Predicates"].get("Allowed", [])
                     banned = data["Predicates"].get("Banned", [])
@@ -149,62 +190,62 @@ def load_keywords_registry():
                         BANNED_PREDICATES.extend(banned)
                 else:
                     data["Predicates"] = {"Allowed": ALLOWED_PREDICATES.copy(), "Banned": BANNED_PREDICATES.copy()}
-                    
                 return extract_all_strings(data), data
         except Exception as e: print(f"[ERREUR] Registre JSON illisible : {e}")
     return set(), {}
 
-def save_keywords_registry(current_registry, new_keywords, original_data):
-    new_ones = [k.strip() for k in new_keywords if k.strip() and k.strip() not in current_registry]
+def save_keywords_registry(current_registry, resolved_tags_dict, original_data):
+    """
+    Sépare les vrais nouveaux termes (Uncategorized_New) 
+    des termes validés par Wikidata (Entities -> Wikidata_Aligned).
+    """
+    new_ones = []
     
-    if isinstance(original_data, dict):
+    for tag, uri in resolved_tags_dict.items():
+        if tag.strip() and tag.strip() not in current_registry:
+            if uri:
+                if "Entities" not in original_data: original_data["Entities"] = {}
+                if "Wikidata_Aligned" not in original_data["Entities"]: original_data["Entities"]["Wikidata_Aligned"] = []
+                if tag not in original_data["Entities"]["Wikidata_Aligned"]:
+                    original_data["Entities"]["Wikidata_Aligned"].append(tag)
+            else:
+                new_ones.append(tag.strip())
+    
+    if new_ones:
         if "Uncategorized_New" not in original_data: original_data["Uncategorized_New"] = []
         original_data["Uncategorized_New"].extend(new_ones)
         original_data["Uncategorized_New"] = sorted(list(set(original_data["Uncategorized_New"])))
         
-        # Ensure Predicates are saved
-        original_data["Predicates"] = {"Allowed": ALLOWED_PREDICATES, "Banned": BANNED_PREDICATES}
+    original_data["Predicates"] = {"Allowed": ALLOWED_PREDICATES, "Banned": BANNED_PREDICATES}
         
     try:
         with open(KEYWORDS_FILE, 'w', encoding='utf-8') as f:
             json.dump(original_data, f, indent=4, ensure_ascii=False)
-    except PermissionError:
-        print(f"        -> [WARNING] Impossible d'écrire '{KEYWORDS_FILE}' (fichier ouvert).")
-    except Exception as e:
-        print(f"        -> [WARNING] Erreur inattendue d'écriture JSON : {e}")
-    return current_registry.union(new_ones)
+    except Exception:
+        pass
+    return current_registry.union(new_ones).union(resolved_tags_dict.keys())
 
 def extract_pdf_content(pdf_path):
     header_text = ""
     body_chunks = []
-    
     try:
         doc = fitz.open(pdf_path)
-        
-        # 1. Extraction de l'En-tête Brut (Titre, Auteur, Abstract)
         for i in range(min(HEADER_PAGES, len(doc))):
             header_text += doc[i].get_text() + "\n"
             
-        # 2. Semantic Chunking (Corps du document par blocs/paragraphes)
         current_chunk_blocks = []
         current_chunk_len = 0
-        OVERLAP_BLOCKS = 3 # On garde les 3 derniers paragraphes pour le contexte du chunk suivant
+        OVERLAP_BLOCKS = 3 
         
         for i in range(HEADER_PAGES, len(doc)):
             page = doc[i]
-            # get_text("blocks") extrait intelligemment les vrais paragraphes sémantiques (index 4 = texte)
             blocks = page.get_text("blocks")
-            
             for b in blocks:
-                block_text = str(b[4]).strip() # [x0, y0, x1, y1, texte, block_no, block_type]
+                block_text = str(b[4]).strip() 
                 if not block_text: continue
                 block_len = len(block_text)
-                
-                # Le bloc sémantique dépasse le plafond du chunk actuel ?
                 if current_chunk_len + block_len > CHUNK_CHARS and current_chunk_blocks:
                     body_chunks.append("\n\n".join(current_chunk_blocks))
-                    
-                    # On prépare le prochain chunk en conservant le chevauchement (Overlap)
                     overlap_slice = current_chunk_blocks[-OVERLAP_BLOCKS:] if len(current_chunk_blocks) >= OVERLAP_BLOCKS else current_chunk_blocks
                     current_chunk_blocks = overlap_slice + [block_text]
                     current_chunk_len = sum(len(bloc) for bloc in current_chunk_blocks)
@@ -212,14 +253,11 @@ def extract_pdf_content(pdf_path):
                     current_chunk_blocks.append(block_text)
                     current_chunk_len += block_len
                     
-        # Exporter le dernier chunk s'il n'est pas vide
         if current_chunk_blocks:
             body_chunks.append("\n\n".join(current_chunk_blocks))
-            
         doc.close()
     except Exception as e:
-        print(f"        -> [WARNING] Erreur sémantique lors de l'extraction PDF: {e}")
-        
+        print(f"        -> [WARNING] Erreur sémantique PDF: {e}")
     return header_text, body_chunks
 
 def parse_opf_info(opf_content, file_path):
@@ -234,17 +272,44 @@ def parse_opf_info(opf_content, file_path):
     tags = re.findall(r'<dc:subject[^>]*>([^<]+)</dc:subject>', opf_content, re.IGNORECASE)
     return book_id, author.group(1) if author else "Inconnu", title.group(1) if title else "Inconnu", [t.strip() for t in tags if t.strip()]
 
-def save_to_obsidian(book_id, titre, auteur, mots_cles, resume, all_triplets):
+def create_or_update_entity_node(entity_name, uri):
+    """Crée un fichier Markdown pour l'entité avec ses métadonnées Wikidata."""
+    if not entity_name: return
+    safe_entity = re.sub(r'[\\/:*?"<>|]', '_', entity_name)
+    node_path = os.path.join(OBSIDIAN_VAULT_PATH, "Nodes", f"{safe_entity}.md")
+    
+    if not os.path.exists(node_path):
+        content = f"---\ntitle: \"{entity_name}\"\n"
+        if uri:
+            content += f"wikidata_uri: \"{uri}\"\nontology_status: \"LOD_Aligned\"\n"
+        else:
+            content += f"ontology_status: \"Local_Concept\"\n"
+        content += f"---\n\n# {entity_name}\n"
+        try:
+            with open(node_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception:
+            pass
+
+def save_to_obsidian(book_id, titre, auteur, resolved_tags_dict, resume, all_triplets):
+    tags_list = list(resolved_tags_dict.keys())
     safe_title = re.sub(r'[\\/:*?"<>|]', '_', titre)
     doc_path = os.path.join(OBSIDIAN_VAULT_PATH, "Nodes", f"{safe_title} - {book_id}.md")
-    content = f"---\nid: {book_id}\ntitle: \"{titre}\"\nauthors: \"{auteur}\"\ntags: {json.dumps(list(mots_cles))}\n---\n\n# {titre}\n\n## Abstract\n{resume}\n\n## CMDB Relationships\n"
+    
+    content = f"---\nid: {book_id}\ntitle: \"{titre}\"\nauthors: \"{auteur}\"\ntags: {json.dumps(tags_list)}\n---\n\n# {titre}\n\n## Abstract\n{resume}\n\n## CMDB Relationships\n"
+    
+    # Génération des pages Nœuds pour les tags globaux
+    for tag, uri in resolved_tags_dict.items():
+        create_or_update_entity_node(tag, uri)
     
     for triplet in all_triplets:
-        # Affichage du statut
+        # Génération des pages Nœuds pour le Sujet et l'Objet
+        create_or_update_entity_node(triplet.subject, triplet.subject_uri)
+        create_or_update_entity_node(triplet.object, triplet.object_uri)
+        
         statut_md = "" if triplet.validation_status == "validated" else " ⚠️#review"
         content += f"- [[{triplet.subject}]] --{triplet.predicate}--> [[{triplet.object}]]{statut_md}\n"
         
-        # Sauvegarde d'un fichier de relation (Edge)
         safe_subject = re.sub(r'[\\/:*?"<>|]', '_', triplet.subject)
         safe_object = re.sub(r'[\\/:*?"<>|]', '_', triplet.object)
         edge_filename = f"{safe_subject} - {triplet.predicate} - {safe_object}.md"
@@ -252,14 +317,12 @@ def save_to_obsidian(book_id, titre, auteur, mots_cles, resume, all_triplets):
         
         edge_content = f"---\nsource: \"[[{triplet.subject}]]\"\ntarget: \"[[{triplet.object}]]\"\npredicate: \"{triplet.predicate}\"\ndocument: \"[[{safe_title} - {book_id}]]\"\nstatus: \"{triplet.validation_status}\"\n---\n\n# Relation: {triplet.subject} -> {triplet.predicate} -> {triplet.object}\n\nExtracted from document: [[{safe_title} - {book_id}]]\n"
         try:
-            with open(edge_path, 'w', encoding='utf-8') as fEdge:
-                fEdge.write(edge_content)
-        except Exception as eEdge:
-            print(f"Erreur d'écriture de la relation: {eEdge}")
+            with open(edge_path, 'w', encoding='utf-8') as fEdge: fEdge.write(edge_content)
+        except Exception: pass
             
     try:
         with open(doc_path, 'w', encoding='utf-8') as f: f.write(content)
-    except Exception as e: print(f"Erreur d'écriture Obsidian: {e}")
+    except Exception: pass
 
 # =========================================================================
 # L'ORCHESTRATEUR LLM
@@ -268,7 +331,6 @@ def ask_llm_pydantic(prompt: str, pydantic_schema, stage_name="LLM"):
     print(f"        -> [{stage_name}] Inférence avec Pydantic Constraint en cours...")
     schema_json = pydantic_schema.model_json_schema()
     
-    # Stratégie anti-blocage (jusqu'à 2 essais si Hard-Fail Zod)
     for attempt in range(2):
         try:
             t0 = time.time()
@@ -280,247 +342,17 @@ def ask_llm_pydantic(prompt: str, pydantic_schema, stage_name="LLM"):
             )
             duration = time.time() - t0
             raw_json = res['message']['content']
-            
-            # Application du Mur Pydantic
             validated_obj = pydantic_schema.model_validate_json(raw_json)
             
-            # Affichage métriques
             p_eval = res.get('prompt_eval_count', 0)
             eval_c = res.get('eval_count', 0)
             rate = (eval_c / duration) if duration > 0 else 0
             print(f"           [Métriques] {duration:.1f}s | {rate:.1f} t/s | Lu: {p_eval} t -> Écrit: {eval_c} t")
-            
             return validated_obj
-            
         except Exception as e:
             print(f"           [Retry {attempt+1}] Hard-Fail intercepté : {e}")
-            prompt += f"\n\n!!! ATTENTION, ta réponse précédente a causé l'erreur Pydantic suivante :\n{e}\nCorrige impérativement le prédicat ou le format avant de répondre de nouveau."
-            
+            prompt += f"\n\n!!! ATTENTION, ta réponse précédente a causé l'erreur :\n{e}\nCorrige avant de répondre."
     return None
-
-def remove_empty_elements(d):
-    """Récursivement supprime les dictionnaires ou listes vides."""
-    if not isinstance(d, (dict, list)):
-        return d
-    if isinstance(d, list):
-        return [v for v in (remove_empty_elements(v) for v in d) if v is not None and v != "" and v != [] and v != {}]
-    if isinstance(d, dict):
-        cleaned = {k: remove_empty_elements(v) for k, v in d.items()}
-        return {k: v for k, v in cleaned.items() if v is not None and v != "" and v != [] and v != {}}
-
-def deep_merge(target, source):
-    """Fusionne récursivement un json généré par le LLM (source) dans le dataset complet (target)."""
-    if isinstance(source, dict):
-        for k, v in source.items():
-            if k not in target:
-                if isinstance(v, list): target[k] = []
-                elif isinstance(v, dict): target[k] = {}
-            
-            if isinstance(target.get(k), list) and isinstance(v, list):
-                clean_t = [str(x).title() for x in v]
-                target[k].extend(clean_t)
-                target[k] = sorted(list(set(target[k])))
-            elif isinstance(target.get(k), dict) and isinstance(v, dict):
-                deep_merge(target[k], v)
-    return target
-
-def extract_ontology_keys(d, parent_keys=None):
-    if parent_keys is None: parent_keys = []
-    keys_map = {}
-    if isinstance(d, dict):
-        for k, v in d.items():
-            if isinstance(v, dict):
-                keys_map[k] = parent_keys + [k]
-                keys_map.update(extract_ontology_keys(v, parent_keys + [k]))
-            elif isinstance(v, list):
-                keys_map[k] = parent_keys + [k]
-    return keys_map
-
-def insert_deep(d, path_list, term):
-    current = d
-    for i, p in enumerate(path_list):
-        if i == len(path_list) - 1:
-            if p not in current:
-                current[p] = []
-            if isinstance(current[p], list):
-                current[p].append(term)
-                current[p] = sorted(list(set(current[p])))
-            elif isinstance(current[p], dict):
-                if "General" not in current[p]: current[p]["General"] = []
-                current[p]["General"].append(term)
-                current[p]["General"] = sorted(list(set(current[p]["General"])))
-        else:
-            if p not in current:
-                current[p] = {}
-            current = current[p]
-
-def clean_thesaurus():
-    print("\n=================================================================")
-    print("   EXÉCUTION DE LA PASSE DE NETTOYAGE DU THESAURUS (DEEP-HYBRID)")
-    print("=================================================================")
-    
-    if not os.path.exists(KEYWORDS_FILE):
-        return
-        
-    try:
-        with open(KEYWORDS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"-> Erreur lecture thesaurus: {e}")
-        return
-        
-    uncategorized = data.get("Uncategorized_New", [])
-    if not uncategorized:
-        print("-> Aucun terme 'Uncategorized_New' à nettoyer.")
-        return
-        
-    print(f"-> Nettoyage de {len(uncategorized)} termes sauvages en cours...")
-    
-    # 1. Nettoyage Python (Deduplication, Parens, Regex, & and/or split)
-    cleaned_terms = set()
-    for t in uncategorized:
-        raw_val = str(t)
-        # Supprimer ce qui est entre parenthèses
-        raw_val = re.sub(r'\(.*?\)', '', raw_val).strip()
-        
-        # Split on " and " and " or "
-        parts = re.split(r'\s+and\s+|\s+or\s+', raw_val, flags=re.IGNORECASE)
-        for part in parts:
-            term = part.strip()
-            if not term: continue
-            if len(term.split()) > 5: continue
-            if bool(re.match(r'^\d', term)): continue
-            cleaned_terms.add(term) # Will titlecase later
-        
-    print(f"   [Étape 1] Split & Regex : {len(uncategorized)} -> {len(cleaned_terms)} termes")
-    
-    # 2. Filtrage NLP (spaCy) : Grammaire et Lemmatisation Strict
-    try:
-        import spacy
-        try:
-            nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            print("   -> Installation du modèle spaCy (en_core_web_sm) requise en arrière-plan...")
-            subprocess.run([sys.executable, "-m", "spacy", "download", "en_core_web_sm"], capture_output=True)
-            nlp = spacy.load("en_core_web_sm")
-            
-        nlp_filtered = set()
-        for term in cleaned_terms:
-            # Lowercase avant l'analyse pour que spaCy détecte bien les pluriels communs (NNS) au lieu des Noms Propres (NNP)
-            doc = nlp(term.lower())
-            has_verb = any(token.pos_ in ["VERB", "AUX"] for token in doc)
-            if not has_verb:
-                # Lemmatisation des pluriels (NNS, NNPS) vers singulier
-                lemma_tokens = []
-                for token in doc:
-                    if token.tag_ in ["NNS", "NNPS"]:
-                        lemma_tokens.append(token.lemma_)
-                    else:
-                        lemma_tokens.append(token.text)
-                
-                # Reconstitue et force le Title Case
-                lemma_term = " ".join(lemma_tokens).title()
-                if lemma_term:
-                    nlp_filtered.add(lemma_term)
-                
-        print(f"   [Étape 2] Filtrage NLP & Lemmatisation (spaCy) : {len(cleaned_terms)} -> {len(nlp_filtered)} termes")
-        terms_to_route = list(nlp_filtered)
-    except ImportError:
-        print("   [Étape 2] Librairie spaCy introuvable. Étape ignorée.")
-        terms_to_route = list({t.title() for t in cleaned_terms})
-
-    # 3. Ancrage Vectoriel FAISS Récursif
-    print("   [Étape 3] Auto-Catégorisation Vectorielle Strict (Nomic)...")
-    anchor = VectorAnchor()
-    ontology_map = {}
-    
-    # Construction récursive de toutes les branches du graphe
-    for top_lvl, content in data.items():
-        if top_lvl in ["Uncategorized_New", "Predicates", "Entities"]: continue
-        if isinstance(content, dict) or isinstance(content, list):
-            keys = extract_ontology_keys({top_lvl: content})
-            ontology_map.update(keys)
-            
-    anchor.index_ontology(list(ontology_map.keys()))
-    
-    slm_fallback = []
-    auto_routed = 0
-    
-    # Seuil extrêmement strict (0.91)
-    for term in terms_to_route:
-        best_match, score = anchor.resolve(term, threshold=0.91)
-        if best_match != term: 
-            path_list = ontology_map[best_match]
-            insert_deep(data, path_list, term)
-            auto_routed += 1
-        else:
-            slm_fallback.append(term)
-            
-    print(f"   -> {auto_routed} termes ont été catégorisés mathématiquement (Seuil > 0.91) !")
-    
-    # 4. Traitement SLM (Ollama Batched)
-    if not slm_fallback:
-        print("   [Étape 4] Aucun terme isolé restant pour le SLM.")
-        data["Uncategorized_New"] = []
-    else:
-        print(f"   [Étape 4] Traitement des {len(slm_fallback)} termes complexes par Qwen (Batches)...")
-        batch_size = 50
-        top_cats = [k for k in data.keys() if k not in ["Uncategorized_New", "Predicates", "Entities"]]
-        
-        failed_terms = []
-        for i in range(0, len(slm_fallback), batch_size):
-            batch = slm_fallback[i:i+batch_size]
-            print(f"      -> Batch SLM [{i+1} à min({i+batch_size}, {len(slm_fallback)})]...")
-            
-            prompt = f"""Role: Expert Data Architect and Ontologist.
-Task: Meticulously process this batch of diverse keywords. 
-1. TRANSLATION: You MUST absolutely translate all non-English terms (especially French terms) to English.
-2. Ensure everything is Title Case.
-3. Categorize them logically under the exact Top-Level Categories provided as root keys.
-4. DEEP HIERARCHY: You are allowed to create deeply nested sub-categories (e.g., "Artificial Intelligence" -> "Generative AI" -> "LLMs" -> ["GPT-4", "Claude"]). Do not clump everything in generic arrays. Create precise N-level dictionary structures where appropriate, ending with an array of the leaf keywords.
-
-Allowed Top-Level Categories (MUST be exactly these Root Keys): {json.dumps(top_cats)}
-
-Input Keywords Batch:
-{json.dumps(batch)}
-
-Output Constraints:
-Output ONLY a valid JSON object matching the exact Top-Level categories as root keys. DO NOT output markdown."""
-
-            try:
-                t0 = time.time()
-                res = ollama.chat(
-                    model=MODEL_NAME, 
-                    messages=[
-                        {'role': 'system', 'content': 'You must output ONLY valid JSON without markdown wrapping. Your sub-categories must be extremely precise, nested dictionary trees if needed.'},
-                        {'role': 'user', 'content': prompt}
-                    ], 
-                    format='json',
-                    options={'num_ctx': 8192, 'temperature': 0.1}
-                )
-                
-                raw_json = res['message']['content']
-                slm_parsed = json.loads(raw_json)
-                duration = time.time() - t0
-                print(f"         [OK] Batch analysé en {duration:.1f}s")
-                
-                # Fusion des résultats récursifs dans 'data'
-                deep_merge(data, slm_parsed)
-            except Exception as e:
-                print(f"         [ERREUR] Batch échoué : {e}")
-                failed_terms.extend(batch)
-
-        data["Uncategorized_New"] = sorted(list(set(failed_terms)))
-    
-    # Nettoyage final des structures vides générées par le LLM ou vidées par le processus
-    data = remove_empty_elements(data)
-        
-    try:
-        with open(KEYWORDS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        print("-> Registre thesaurus.json nettoyé et sauvegardé avec succès.")
-    except Exception as e:
-        print(f"-> Erreur d'écriture finale: {e}")
 
 # =========================================================================
 # MAIN PIPELINE
@@ -528,33 +360,23 @@ Output ONLY a valid JSON object matching the exact Top-Level categories as root 
 def main():
     ensure_dirs()
     print("=================================================================")
-    print("   SCRIPT D'INDEXATION V5 (OPEN IE, PYDANTIC & VECTOR ANCHORING) ")
+    print("   SCRIPT D'INDEXATION V6 (PYDANTIC, VECTOR ANCHORING & WIKIDATA) ")
     print("=================================================================\n")
-    print("Ce script industrialise votre CMDB dans Neo4j/Obsidian via la structuration Pydantic et FAISS.")
-    print("  [1] MODE NOUVEAUX : Ne traite que les documents vierges de mots-clés Calibre.")
-    print("  [2] MODE COMPLET  : Retraite absolument l'intégralité de la bibliothèque.\n")
     
-    mode = input("Votre choix (1 ou 2) : ").strip()
+    mode = input("Mode d'exécution (1=Nouveaux, 2=Complet) : ").strip()
     root_tk = tk.Tk(); root_tk.withdraw(); root_tk.attributes('-topmost', True)
     folder_path = filedialog.askdirectory(title="Racine Calibre")
     if not folder_path: return
 
     calibredb_path = r"C:\Program Files\Calibre2\calibredb.exe" if os.path.exists(r"C:\Program Files\Calibre2\calibredb.exe") else "calibredb"
-    
     registry_list, original_data = load_keywords_registry()
     
     high_level_categories = [str(k) for k in original_data.keys() if k not in ["Uncategorized_New", "Predicates", "Entities"]]
-    entities_data = original_data.get("Entities", {})
-    entities_categories = [str(k) for k in entities_data.keys()] if isinstance(entities_data, dict) else []
-    registry_str = ", ".join(high_level_categories + ["Entities"] + entities_categories)
+    registry_str = ", ".join(high_level_categories)
     
-    # -------------------------------------------------------------
-    # ÉTAPE 3 INITIALE : PRÉPARATION DU MOTEUR VECTORIEL
-    # -------------------------------------------------------------
     anchor_engine = VectorAnchor()
     anchor_engine.index_ontology(list(registry_list))
     
-    # Scan Calibre
     files_to_process = []
     for root, _, files in os.walk(folder_path):
         for fn in files:
@@ -567,17 +389,12 @@ def main():
                     files_to_process.append({'bid': bid, 'auth': auth, 'tit': tit, 'pdf': pdf_p, 'root': root})
 
     print(f"\n[INFO] {len(files_to_process)} documents à traiter.\n")
-    global_kg_db = []
     
     for i, data in enumerate(files_to_process):
         print(f"\n=================================================================")
         print(f"[{i+1}/{len(files_to_process)}] ID={data['bid']} | {data['tit']}")
-        print(f"        Extraction du texte PDF (en-tête + suite)...")
         h_text, chunks = extract_pdf_content(data['pdf'])
         
-        # -------------------------------------------------------------
-        # EXTRACTION HEADER (Titre, Auteur, 8 Keywords, Triplets Initiaux)
-        # -------------------------------------------------------------
         prompt_h = f"""You are an Open Information Extraction Orchestrator.
 Analyze the first 5 pages of this document.
 1/ Extract the exact title and author. Calibre metadata gives us: Title='{data['tit']}', Author='{data['auth']}'. Use these unless the document text strongly suggests otherwise.
@@ -590,20 +407,12 @@ Existing vocabulary high-level topics for context: {registry_str}
 Text:
 {h_text}"""
         
-        meta = ask_llm_pydantic(prompt_h, OpenIEMining, stage_name="En-tête (Pages 1-5)")
-        if not meta: 
-            print("        -> Échec total de l'extraction sur ce fichier.")
-            continue
+        meta = ask_llm_pydantic(prompt_h, OpenIEMining, stage_name="En-tête")
+        if not meta: continue
             
-        print(f"        -> [DÉTECTÉ] Titre : {meta.title}")
-        print(f"        -> [DÉTECTÉ] Auteur : {meta.author}")
-        
         all_triplets = meta.triplets
         all_tags = set(meta.keywords)
         
-        # -------------------------------------------------------------
-        # EXTRACTION CHUNKS (Uniquement des Triplets pour ne pas polluer les tags)
-        # -------------------------------------------------------------
         for j, chunk in enumerate(chunks):
             prompt_c = f"""Enrich the Knowledge Graph from this fragment.
 Strictly FORBIDDEN to use weak verbs: {BANNED_PREDICATES}.
@@ -612,52 +421,39 @@ If possible, link your concepts to existing vocabulary (T-Box) context: {registr
 
 Text:
 {chunk}"""
-            c_data = ask_llm_pydantic(prompt_c, ChunkMining, stage_name=f"Graphe - Morceau {j+1}/{len(chunks)}")
-            if c_data:
-                all_triplets.extend(c_data.triplets)
+            c_data = ask_llm_pydantic(prompt_c, ChunkMining, stage_name=f"Graphe - Chunk {j+1}/{len(chunks)}")
+            if c_data: all_triplets.extend(c_data.triplets)
         
-        # -------------------------------------------------------------
-        # ANCRAGE VECTORIEL (RÉSOLUTION D'ENTITÉS T-BOX)
-        # -------------------------------------------------------------
+        # --- ANCRAGE VECTORIEL ASYMÉTRIQUE ET WIKIDATA ---
         resolved_triplets = []
-        print(f"        -> Ancrage vectoriel des {len(all_triplets)} triplets extraits...")
+        print(f"        -> Ancrage vectoriel & Wikidata des {len(all_triplets)} triplets...")
         for triplet in all_triplets:
-            # Threshold de 0.85 (ou 0.82) pour `nomic-embed-text`
-            clean_s, _ = anchor_engine.resolve(triplet.subject, threshold=0.82)
-            clean_o, _ = anchor_engine.resolve(triplet.object, threshold=0.82)
+            # Sujet : Ancrage Fort (0.80)
+            clean_s, _, uri_s = anchor_engine.resolve(triplet.subject, threshold=0.80)
+            # Objet : Ancrage Stricte/Local (0.88) ou Fallback Wikidata
+            clean_o, _, uri_o = anchor_engine.resolve(triplet.object, threshold=0.88)
+            
             triplet.subject = clean_s
+            triplet.subject_uri = uri_s
             triplet.object = clean_o
+            triplet.object_uri = uri_o
             resolved_triplets.append(triplet)
             
-        # Résolution vectorielle des mots clés globaux aussi !
-        resolved_tags = set()
+        resolved_tags_dict = {}
         for t in all_tags:
-            clean_t, _ = anchor_engine.resolve(t, threshold=0.82)
-            resolved_tags.add(clean_t)
+            clean_t, _, uri_t = anchor_engine.resolve(t, threshold=0.80)
+            resolved_tags_dict[clean_t] = uri_t
             
-        final_tags = list(resolved_tags)
+        print(f"        -> Triplets consolidés : {len(resolved_triplets)}")
         
-        print(f"        -> Bilan des mots-clés finaux : {final_tags}")
-        print(f"        -> Nombre de triplets consolidés pour Neo4j/Obsidian : {len(resolved_triplets)}")
-        
-        # Sync Calibre
+        final_tags_list = list(resolved_tags_dict.keys())
         subprocess.run([calibredb_path, 'set_metadata', '--with-library', folder_path, data['bid'], 
                         '--field', f"title:{meta.title}", '--field', f"authors:{meta.author}",
-                        '--field', f"tags:{', '.join(final_tags)}", '--field', f"comments:{meta.summary}"], capture_output=True)
+                        '--field', f"tags:{', '.join(final_tags_list)}", '--field', f"comments:{meta.summary}"], capture_output=True)
         
-        # Sync Obsidian
-        save_to_obsidian(data['bid'], meta.title, meta.author, final_tags, meta.summary, resolved_triplets)
-        
-        # Sync Registry (Seulement les tags ancrés, s'ils sont nouveaux ils sont "Uncategorized_New")
-        registry_list = save_keywords_registry(registry_list, final_tags, original_data)
-        
-        # Update Anchor Engine in memory with new tags to benefit subsequent documents
+        save_to_obsidian(data['bid'], meta.title, meta.author, resolved_tags_dict, meta.summary, resolved_triplets)
+        registry_list = save_keywords_registry(registry_list, resolved_tags_dict, original_data)
         anchor_engine.index_ontology(list(registry_list))
-
-        print("        -> Synchronisation terminée [OK]")
-
-    # Passe de Nettoyage LLM à la fin de tous les documents
-    clean_thesaurus()
 
 if __name__ == "__main__":
     try:
