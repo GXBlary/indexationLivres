@@ -1,51 +1,41 @@
-# Industrial Knowledge Graph Pipeline (V6/V7)
+# PDFRenamer & Calibre Indexer
 
-This project implements a deterministic, high-precision pipeline for mining semantic ontologies and building a Knowledge Graph from PDF documents.
+Ce projet est un utilitaire d'automatisation locale. Son but est d'analyser des documents PDF bruts, d'en extraire les métadonnées principales (Titre, Auteur, Résumé, Mots-clés) grâce à un modèle NLP local, de le renommer proprement pour garantir sa compatibilité système, et de l'indexer automatiquement dans **Calibre**.
 
-## Workflow Orchestration
+## Fonctionnement Central (`indexer.py`)
 
-The entire pipeline is controlled via the central orchestrator:
-`python main_pipeline.py`
+### 1. Analyse Locale 
+L'outil s'appuie sur `Ollama` et le modèle `qwen2.5:7b-instruct-q4_K_M` pour extraire intelligemment :
+- **Titre**,
+- **Auteur** (avec une logique spéciale pour identifier les publications d'Institutions comme McKinsey ou l'OCDE),
+- **Résumé** (récupération de l'Abstract d'origine s'il existe),
+- **Mots-clés / Tags**.
 
-This menu allows you to run the full sequence or selective steps.
+### 2. Renommage Qualitatif
+Les PDF sont renommés sur le format `Auteur_-_Titre.pdf`.
+Le script retire les diacritiques, remplace les espaces par des underscores, et gère les potentiels doublons en ajoutant un suffixe numérique.
 
----
+### 3. Indexation Calibre
+Le script s'interface avec la CLI de Calibre (`calibredb`) pour :
+- Ajouter le PDF à la bibliothèque,
+- Injecter les `Tags` et les `Comments` (Résumé),
+- Assigner directement l'Auteur et le Titre conformes dans l'outil.
 
-## Pipeline Components
+## Installation & Configuration
 
-### Étape 0 : Renommage des Fichiers (`renamer.py`)
-Nettoie les noms de fichiers PDF en utilisant le LLM pour extraire le titre et l'auteur. 
-- **Sortie** : `Auteur_Titre_du_Document.pdf` (normalisé sans accents).
+1. **Environnement** : Installez un environnement Python et installez les prérequis (notamment `pymupdf`, `ollama` et `python-dotenv`).
+2. **Variables d'environnement** : Configurez votre fichier `.env` à la racine :
+   ```env
+   # Chemin optionnel si différentes bibliothèques Calibre existent
+   CALIBRE_LIBRARY_PATH="D:\Chemin\Vers\Bibliotheque"
+   ```
+3. **Calibre CLI** : Assurez-vous que l'exécutable de Calibre (`calibredb`) est disponible dans le `PATH` Windows.
+4. **Ollama** : Assurez-vous qu'Ollama tourne en fond avec le modèle requis.
 
-### Étape 1 : Construction de la Taxonomie (`build_taxonomy.py`)
-Génère la **T-Box** (le schéma) via l'algorithme de **Semantic Gravity Clustering**.
-- **Moteur** : Sentence-Transformers (`all-MiniLM-L6-v2`).
-- **Sortie** : `thesaurus.json` (Taxonomie à 12 racines + Quarantaine d'Outliers).
+## Utilisation
 
-### Étape 2 : Extraction & Enrichissement (`fix_metadata_v5.py`)
-Moteur principal d'extraction **Open IE** utilisant Pydantic et un ancrage asymétrique à 3 niveaux :
-1. **Ancrage Local** : Raccordement aux racines de la T-Box locale.
-2. **LOD Fallback** : Réconciliation avec l'API REST Wikidata pour canonisation et Entity Linking (Q-ID).
-3. **True Outlier** : Conservation du texte brut pour les concepts émergents.
-- **Sortie** : Nœuds et Relations Markdown dans `Obsidian_Vault/`.
-
-### Utilitaire : Maintenance du Thésaurus (`thesaurus_manager.py`)
-Post-traitement du thésaurus pour intégrer les nouveaux concepts.
-- **NLP** : Lemmatisation spaCy pour supprimer les pluriels et les verbes.
-- **Vector Routing** : Auto-catégorisation via FAISS (seuil 0.91).
-- **SLM Recovery** : Classification par lot via Qwen pour les cas complexes.
-
----
-
-## Configuration
-- **Model** : `qwen2.5:7b-instruct-q4_K_M`
-- **Embeddings** : `nomic-embed-text` (Local)
-- **Local Model Path** : `./models/all-MiniLM-L6-v2` (for gravity clustering)
-
----
-
-## Glossary
-- **T-Box** : Terminological Box (Schema/Ontology).
-- **A-Box** : Assertion Box (The actual triplets extracted from document text).
-- **Semantic Gravity** : Scoring based on Document Frequency combined with Local Semantic Density.
-- **Entity Canonization** : Matching a raw term to a universal Wikidata identifier (Q-ID).
+Déposez vos PDF dans n'importe quel dossier (ex: `Inbox/`) puis lancez le script en exécutant :
+```bash
+python indexer.py
+```
+Un sélecteur de dossier s'ouvrira, choisissez le répertoire contenant les PDF à traiter et le script fera l'ingestion automatiquement.

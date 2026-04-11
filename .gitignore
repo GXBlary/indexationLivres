@@ -1,0 +1,8 @@
+Obsidian_Vault/
+old/
+Inbox/
+__pycache__/
+*.pyc
+.env
+concepts_cache.json
+knowledge_graph.jsonl
