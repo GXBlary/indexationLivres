@@ -16,22 +16,6 @@ import xml.etree.ElementTree as ET
 import urllib.request
 import urllib.parse
 from dotenv import load_dotenv
-import datetime
-
-class LoggerTee:
-    def __init__(self, filename):
-        self.terminal = sys.stdout
-        self.log = open(filename, "a", encoding="utf-8")
-        
-    def write(self, message):
-        self.terminal.write(message)
-        if self.log:
-            self.log.write(message)
-            self.log.flush()
-            
-    def flush(self):
-        self.terminal.flush()
-        if self.log: self.log.flush()
 from typing import Any
 from tenacity import retry, stop_after_attempt, wait_random_exponential, retry_if_exception
 import pydantic
@@ -101,12 +85,6 @@ rate_limiter = SyncTokenBucket(15)
 class HierarchyResponse(pydantic.BaseModel):
     hierarchy: str
 
-class MetadataResponse(pydantic.BaseModel):
-    titre: str
-    auteur: str
-    resume: str
-    mots_cles: list[str]
-
 @retry(
     wait=wait_random_exponential(multiplier=1, min=4, max=60),
     stop=stop_after_attempt(5),
@@ -133,9 +111,8 @@ def _ask_gemini_hierarchy(prompt: str) -> str:
 
 def _ask_ollama_hierarchy(prompt: str) -> str:
     schema = HierarchyResponse.model_json_schema()
-    local_model = "qwen2.5:7b-instruct-q4_K_M" if LLM_BACKEND == "gemini" else MODEL_NAME
     try:
-        response = ollama.chat(model=local_model, messages=[{'role': 'user', 'content': prompt}], format=schema)
+        response = ollama.chat(model=MODEL_NAME, messages=[{'role': 'user', 'content': prompt}], format=schema)
         res = json.loads(response['message']['content'])
         return res.get('hierarchy', "")
     except Exception as e:
@@ -156,11 +133,7 @@ RULES:
 6. Return a valid JSON.
 """
     if LLM_BACKEND == "gemini" and gemini_client:
-        try:
-            return _ask_gemini_hierarchy(prompt)
-        except Exception as e:
-            print(f"  -> [Avertissement] Quota Gemini expiré, bascule sur Ollama pour générer la taxonomie...")
-            return _ask_ollama_hierarchy(prompt)
+        return _ask_gemini_hierarchy(prompt)
     else:
         return _ask_ollama_hierarchy(prompt)
 
@@ -320,62 +293,24 @@ def extract_text_from_document(file_path, max_pages=10):
     except: pass
     return text
 
-@retry(
-    wait=wait_random_exponential(multiplier=1, min=4, max=60),
-    stop=stop_after_attempt(5),
-    retry=retry_if_exception(lambda e: any(kw in str(e).lower() for kw in ("429", "exhausted", "quota", "timeout", "connection", "503", "unavailable")))
-)
-def _ask_gemini_metadata(prompt: str) -> tuple[dict, int]:
-    rate_limiter.consume()
-    response = gemini_client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=MetadataResponse,
-            temperature=0.2
-        ),
-    )
-    tokens = 0
-    if response and hasattr(response, 'usage_metadata') and response.usage_metadata:
-        tokens = response.usage_metadata.total_token_count
-    
-    if response and response.text:
-        return json.loads(response.text), tokens
-    return {}, 0
-
-def _ask_ollama_metadata(prompt: str) -> tuple[dict, int]:
-    schema = MetadataResponse.model_json_schema()
-    local_model = "qwen2.5:7b-instruct-q4_K_M" if LLM_BACKEND == "gemini" else MODEL_NAME
-    response = ollama.chat(model=local_model, messages=[{'role': 'user', 'content': prompt}], format=schema)
-    tokens = response.get('prompt_eval_count', 0) + response.get('eval_count', 0)
-    return json.loads(response['message']['content']), tokens
-
 def get_metadata_from_llm(text):
-    prompt = f"Extract Title, Author, Summary (English), Keywords (3-5) from this text: {text[:3000]}."
-    res = {}
-    tokens = 0
-    start_t = time.time()
-    
-    if LLM_BACKEND == "gemini" and gemini_client:
-        print(f"  -> [LLM] Extraction des métadonnées du document avec Gemini ({MODEL_NAME})...")
-        try:
-            res, tokens = _ask_gemini_metadata(prompt)
-        except Exception as e:
-            fallback_model = "qwen2.5:7b-instruct-q4_K_M"
-            print(f"  -> [Avertissement] Gemini indisponible ({e}). Fallback sur Ollama Locale ({fallback_model})...")
-            res, tokens = _ask_ollama_metadata(prompt)
-    else:
-        print(f"  -> [LLM] Extraction des métadonnées du document avec Ollama Locale ({MODEL_NAME})...")
-        try:
-            res, tokens = _ask_ollama_metadata(prompt)
-        except Exception as e:
-            print(f"  -> [Erreur LLM Local] {e}")
+    prompt = f"Extract Title, Author, Summary (English), Keywords (3-5) from this text: {text[:3000]}. Return JSON format: {{\"titre\": \"\", \"auteur\": \"\", \"resume\": \"\", \"mots_cles\": []}}"
+    try:
+        if LLM_BACKEND == "gemini" and gemini_client:
+            rate_limiter.consume()
+            response = gemini_client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            res = json.loads(response.text)
+        else:
+            response = ollama.chat(model=MODEL_NAME, messages=[{'role': 'user', 'content': prompt}], format='json')
+            res = json.loads(response['message']['content'])
             
-    elapsed = time.time() - start_t
-    print(f"  -> [Stats] Temps d'exécution LLM: {elapsed:.2f}s | Tokens: {tokens}")
-    kw = [align_single_tag(k) for k in res.get('mots_cles', [])]
-    return res.get('titre', ''), res.get('auteur', ''), res.get('resume', ''), filter(None, kw)
+        kw = [align_single_tag(k) for k in res.get('mots_cles', [])]
+        return res.get('titre', ''), res.get('auteur', ''), res.get('resume', ''), filter(None, kw)
+    except: return "", "", "", []
 
 def process_directory(directory):
     batch_harmonize_calibre_tags()
@@ -384,46 +319,14 @@ def process_directory(directory):
     for f in os.listdir(directory):
         if not f.lower().endswith('.pdf'): continue
         path = os.path.join(directory, f)
-        
-        print(f"\n{'='*50}")
-        print(f"📄 DOCUMENT : {f}")
-        print(f"{'='*50}")
-        
-        print("  -> Lecture du fichier et extraction du texte...")
         txt = extract_text_from_document(path)
-        
         title, author, summary, tags = get_metadata_from_llm(txt)
-        
         if title and author:
-            print(f"  -> [Succès] Métadonnées trouvées :")
-            print(f"     - Titre  : {title}")
-            print(f"     - Auteur : {author}")
-            print(f"     - Tags   : {', '.join(tags)}")
-            
-            # Calibre add logic simplified for the sake of the exercise
-            print(f"  -> Déplacement du fichier vers le dossier 'indexed/'...")
+            print(f"-> Indexé: {title} ({author})")
             shutil.move(path, os.path.join(indexed_dir, f))
-            print(f"✅ Opération terminée pour {f}.")
-        else:
-            print(f"❌ Échec de l'extraction des métadonnées pour {f}.")
 
 if __name__ == "__main__":
-    import os
-    from datetime import datetime
-    
-    # Initialize robust session logging
-    log_dir = "logs"
-    os.makedirs(log_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sys.stdout = LoggerTee(os.path.join(log_dir, f"{timestamp}.log"))
-
     if len(sys.argv) > 1:
         process_directory(sys.argv[1])
     else:
-        root = tk.Tk()
-        root.withdraw()
-        folder_selected = filedialog.askdirectory(title="Sélectionnez le dossier contenant les PDF à indexer")
-        if folder_selected:
-            process_directory(folder_selected)
-        else:
-            print("Aucun dossier sélectionné. Annulation.")
+        print("Usage: python indexer.py <directory>")
