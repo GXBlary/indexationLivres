@@ -9,6 +9,7 @@ user = os.getenv("NEO4J_USER", "neo4j")
 password = os.getenv("NEO4J_PASSWORD", "z?gCS%hg9pyB?:9c")
 
 TAG_MAPPING_FILE = "tag_mapping.json"
+BOOK_REGISTRY_FILE = "book_registry.json"
 
 def clean_database(session):
     print("-> Nettoyage de l'ancienne taxonomie dans Neo4j...")
@@ -30,10 +31,47 @@ def create_hierarchy(session, hierarchy_str):
         """
         session.run(query, child=child, parent=parent)
         
-    # S'il n'y a qu'un seul segment (racine), on s'assure qu'il existe
     if len(segments) == 1:
         query = "MERGE (n:Tag {name: $name})"
         session.run(query, name=segments[0].title())
+
+def create_books(session, registry_path):
+    if not os.path.exists(registry_path):
+        print(f"-> [Avis] Aucun registre {registry_path} trouvé. Saut de l'export des livres.")
+        return
+        
+    with open(registry_path, 'r', encoding='utf-8') as f:
+        books = json.load(f)
+        
+    print(f"-> Export de {len(books)} livres et leurs relations...")
+    for book in books:
+        title = book.get('title')
+        authors = book.get('authors')
+        file_path = book.get('file_path', '')
+        year = book.get('year', '0000')
+        tags = book.get('tags', [])
+        
+        # Créer le noeud Book
+        book_query = """
+        MERGE (b:Book {title: $title, authors: $authors})
+        SET b.path = $path, b.year = $year
+        RETURN b
+        """
+        session.run(book_query, title=title, authors=authors, path=file_path, year=year)
+        
+        # Lier aux tags (uniquement la feuille de chaque chemin hiérarchique)
+        for t_path in tags:
+            segments = [s.strip() for s in t_path.split('.') if s.strip()]
+            if not segments: continue
+            
+            leaf = segments[-1].title()
+            
+            rel_query = """
+            MATCH (b:Book {title: $title, authors: $authors})
+            MATCH (t:Tag {name: $leaf})
+            MERGE (b)-[:MENTIONS]->(t)
+            """
+            session.run(rel_query, title=title, authors=authors, leaf=leaf)
 
 def main():
     print(f"Connexion à Neo4j ({uri})...")
@@ -51,6 +89,9 @@ def main():
             for k, val in mapping.items():
                 if val:
                     create_hierarchy(session, val)
+            
+            # Étape 2: Export des Livres
+            create_books(session, BOOK_REGISTRY_FILE)
                     
             result = session.run("MATCH (n:Tag) RETURN count(n) as node_count")
             nodes = result.single()[0]

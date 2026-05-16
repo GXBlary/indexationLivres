@@ -1,6 +1,4 @@
-PyMuPDF
+kreuzberg
 ollama
 python-dotenv
-paddleocr
 numpy
-Pillow

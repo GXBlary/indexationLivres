@@ -21,6 +21,12 @@ Le script s'interface avec la CLI de Calibre (`calibredb`) pour :
 - Injecter les `Tags` et les `Comments` (Résumé),
 - Assigner directement l'Auteur et le Titre conformes dans l'outil.
 
+### 4. Alignement de Taxonomie LOD (Wikidata & Gemini)
+Pour éviter l'accumulation de tags plats et incohérents, le script intègre un moteur d'alignement hiérarchique :
+- **Wikidata First** : Utilisation des propriétés professionnelles **LoC (Library of Congress)**, **Dewey (DDC)** et **BISAC** pour ancrer les tags dans des ontologies standardisées.
+- **Gemini Batch Optimization** : Utilisation de l'API Batch de Google pour traiter des milliers de tags à bas coût et haute vitesse.
+- **Hygiène Strict** : Limitation à 5 niveaux de profondeur et expansion automatique des acronymes (ex: NLP -> Natural Language Processing).
+
 ## Installation & Configuration
 
 1. **Environnement** : Installez un environnement Python et installez les prérequis (notamment `pymupdf`, `ollama` et `python-dotenv`).

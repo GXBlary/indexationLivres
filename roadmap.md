@@ -11,7 +11,8 @@ Ce document trace les évolutions de l'utilitaire d'indexation. Initialement aba
 | Extraction Résumé/Keywords | ✅ Stable (Gemini 2.5 + Fallback Ollama) | `indexer.py` |
 | Renommage FS Safe | ✅ Stable | `indexer.py` |
 | Indexation Calibre | ✅ Opérationnel (`calibredb`) | `indexer.py` |
-| Taxonomie Hiérarchique | ✅ En prod. (Hybride: Wikidata + Gemini) | `indexer.py`, `fast_enrich.py`|
+| Taxonomie Hiérarchique | ✅ En prod. (LOD: Wikidata LoC/Dewey/BISAC) | `indexer.py` |
+| Optimisation Coûts | ✅ Gemini Batch API intégré | `indexer.py` |
 | Visualisation Neo4j | ✅ Opérationnel (Base 'tags') | `export_to_neo4j.py` |
 
 ---
@@ -29,3 +30,8 @@ Ce document trace les évolutions de l'utilitaire d'indexation. Initialement aba
 ### 3. Modélisation LLM & Structuration Pydantic
 - **Actuel** : Transition réussie vers un modèle hybride : **Gemini 2.5 Flash** (via SDK `google.genai` avec Pydantic Structuring) couplé à un `TokenBucket` anti-quota, et **Ollama (Qwen2.5 7B)** en fallback de sécurité.
 - **Prochaine Étape** : Monitorer à long terme les temps de réponse et l'impact sur le "Daily Quota" gratuit de Gemini pour rééquilibrer le trafic Cloud/Local si nécessaire.
+
+### 4. Audit & Rationalisation de la Taxonomie
+- **Statut** : En cours.
+- **Objectif** : Utiliser le `consistency_report.md` pour identifier les feuilles orphelines et les conflits de branches.
+- **Action** : Finaliser l'indexation globale via la logique Wikidata forcée pour établir un baseline propre avant toute intervention manuelle.

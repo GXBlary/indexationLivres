@@ -6,3 +6,9 @@ __pycache__/
 .env
 concepts_cache.json
 knowledge_graph.jsonl
+
+.venv/
+logs/
+scratch/
+sync_only/
+vault/
